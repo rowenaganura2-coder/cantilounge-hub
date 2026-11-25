@@ -1,0 +1,494 @@
+ALTER TABLE public.orders 
+ADD COLUMN IF NOT EXISTS payment_method text,
+ADD COLUMN IF NOT EXISTS cash_received numeric DEFAULT 0,
+ADD COLUMN IF NOT EXISTS gcash_amount numeric DEFAULT 0,
+ADD COLUMN IF NOT EXISTS gcash_reference text,
+ADD COLUMN IF NOT EXISTS payment_reference text,
+ADD COLUMN IF NOT EXISTS settled_at timestamptz;
+
+CREATE OR REPLACE FUNCTION public.modify_order(_order_id uuid, _items jsonb)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  o public.orders;
+  current_item public.order_items;
+  menu_item public.menu_items;
+  change_item jsonb;
+  new_quantity int;
+  old_quantity int;
+  quantity_delta int;
+  new_modifiers jsonb;
+  new_price numeric;
+  subtotal numeric;
+  new_discount numeric;
+  recipe record;
+  before_items jsonb;
+  after_items jsonb;
+BEGIN
+  IF NOT public.has_any_role(auth.uid(), ARRAY['ADMIN','MANAGER','CASHIER']::public.app_role[]) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  IF jsonb_typeof(_items) IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'Invalid order items';
+  END IF;
+
+  SELECT * INTO o FROM public.orders WHERE id = _order_id FOR UPDATE;
+  IF o.id IS NULL THEN RAISE EXCEPTION 'Order not found'; END IF;
+  IF o.settled_at IS NOT NULL OR o.status IN ('COMPLETED','CANCELLED') THEN
+    RAISE EXCEPTION 'Only unsettled active orders can be modified';
+  END IF;
+  IF (SELECT count(*) FROM public.order_items WHERE order_id = _order_id)
+    <> (SELECT count(DISTINCT item->>'id')
+        FROM jsonb_array_elements(_items) AS entries(item)
+        WHERE item->>'id' IS NOT NULL) THEN
+    RAISE EXCEPTION 'Ticket changes must include each existing line item exactly once';
+  END IF;
+
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', id, 'menu_item_id', menu_item_id, 'quantity', quantity,
+    'modifiers', modifiers, 'item_price', item_price, 'item_status', item_status
+  ) ORDER BY id), '[]'::jsonb)
+  INTO before_items
+  FROM public.order_items WHERE order_id = _order_id;
+
+  FOR change_item IN SELECT * FROM jsonb_array_elements(_items) LOOP
+    new_quantity := COALESCE((change_item->>'quantity')::int, 0);
+    IF new_quantity < 0 THEN RAISE EXCEPTION 'Quantity cannot be negative'; END IF;
+    new_modifiers := change_item->'modifiers';
+
+    IF change_item->>'id' IS NULL THEN
+      IF new_quantity = 0 THEN CONTINUE; END IF;
+      SELECT * INTO menu_item
+      FROM public.menu_items
+      WHERE id = (change_item->>'menu_item_id')::uuid AND is_available;
+      IF menu_item.id IS NULL THEN RAISE EXCEPTION 'Menu item is unavailable'; END IF;
+      new_price := menu_item.base_price +
+        CASE WHEN new_modifiers->>'milk' = 'oat' THEN 30 ELSE 0 END;
+
+      FOR recipe IN
+        SELECT r.ingredient_id, r.quantity_req, i.is_available
+        FROM public.recipe_ingredients r
+        JOIN public.ingredients i ON i.id = r.ingredient_id
+        WHERE r.menu_item_id = menu_item.id
+      LOOP
+        IF NOT recipe.is_available THEN
+          RAISE EXCEPTION 'An ingredient for this item is unavailable';
+        END IF;
+        UPDATE public.ingredients
+        SET current_stock = current_stock - recipe.quantity_req * new_quantity
+        WHERE id = recipe.ingredient_id
+          AND current_stock >= recipe.quantity_req * new_quantity;
+        IF NOT FOUND THEN RAISE EXCEPTION 'Insufficient stock to add this item'; END IF;
+        INSERT INTO public.stock_transactions(ingredient_id, change, reason, order_id, user_id)
+        VALUES (
+          recipe.ingredient_id,
+          -recipe.quantity_req * new_quantity,
+          'ORDER_EDIT',
+          _order_id,
+          auth.uid()
+        );
+      END LOOP;
+
+      INSERT INTO public.order_items(
+        order_id, menu_item_id, name, station, quantity, modifiers, item_price, item_status
+      ) VALUES (
+        _order_id, menu_item.id, menu_item.name, menu_item.target_station,
+        new_quantity, new_modifiers, new_price, 'PENDING'
+      );
+      CONTINUE;
+    END IF;
+
+    SELECT * INTO current_item
+    FROM public.order_items
+    WHERE id = (change_item->>'id')::uuid AND order_id = _order_id
+    FOR UPDATE;
+    IF current_item.id IS NULL THEN RAISE EXCEPTION 'Order item not found'; END IF;
+    IF change_item->>'menu_item_id' IS DISTINCT FROM current_item.menu_item_id::text THEN
+      RAISE EXCEPTION 'An existing line item cannot be changed to a different menu item';
+    END IF;
+
+    old_quantity := CASE
+      WHEN current_item.item_status = 'CANCELLED' THEN 0
+      ELSE current_item.quantity
+    END;
+    quantity_delta := new_quantity - old_quantity;
+
+    FOR recipe IN
+      SELECT r.ingredient_id, r.quantity_req, i.is_available
+      FROM public.recipe_ingredients r
+      JOIN public.ingredients i ON i.id = r.ingredient_id
+      WHERE r.menu_item_id = current_item.menu_item_id
+    LOOP
+      IF quantity_delta > 0 THEN
+        IF NOT recipe.is_available THEN
+          RAISE EXCEPTION 'An ingredient for this item is unavailable';
+        END IF;
+        UPDATE public.ingredients
+        SET current_stock = current_stock - recipe.quantity_req * quantity_delta
+        WHERE id = recipe.ingredient_id
+          AND current_stock >= recipe.quantity_req * quantity_delta;
+        IF NOT FOUND THEN RAISE EXCEPTION 'Insufficient stock to increase this item'; END IF;
+      ELSIF quantity_delta < 0 THEN
+        UPDATE public.ingredients
+        SET current_stock = current_stock - recipe.quantity_req * quantity_delta
+        WHERE id = recipe.ingredient_id;
+      END IF;
+      IF quantity_delta <> 0 THEN
+        INSERT INTO public.stock_transactions(ingredient_id, change, reason, order_id, user_id)
+        VALUES (
+          recipe.ingredient_id,
+          -recipe.quantity_req * quantity_delta,
+          CASE WHEN quantity_delta > 0 THEN 'ORDER_EDIT' ELSE 'ORDER_EDIT_RESTOCK' END,
+          _order_id,
+          auth.uid()
+        );
+      END IF;
+    END LOOP;
+
+    SELECT mi.base_price + CASE WHEN new_modifiers->>'milk' = 'oat' THEN 30 ELSE 0 END
+    INTO new_price
+    FROM public.menu_items mi
+    WHERE mi.id = current_item.menu_item_id;
+    IF new_price IS NULL THEN RAISE EXCEPTION 'Menu item not found'; END IF;
+
+    UPDATE public.order_items
+    SET quantity = GREATEST(new_quantity, 1),
+        modifiers = new_modifiers,
+        item_price = new_price,
+        item_status = CASE
+          WHEN new_quantity = 0 THEN 'CANCELLED'::public.order_status
+          WHEN quantity_delta <> 0 OR current_item.modifiers IS DISTINCT FROM new_modifiers
+            THEN 'PENDING'::public.order_status
+          ELSE current_item.item_status
+        END
+    WHERE id = current_item.id;
+  END LOOP;
+
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', id, 'menu_item_id', menu_item_id, 'quantity', quantity,
+    'modifiers', modifiers, 'item_price', item_price, 'item_status', item_status
+  ) ORDER BY id), '[]'::jsonb),
+    COALESCE(sum(item_price * quantity) FILTER (WHERE item_status <> 'CANCELLED'), 0)
+  INTO after_items, subtotal
+  FROM public.order_items WHERE order_id = _order_id;
+  IF subtotal <= 0 THEN RAISE EXCEPTION 'Void the entire ticket when no items remain'; END IF;
+
+  new_discount := CASE o.discount_type
+    WHEN 'STUDENT' THEN round(subtotal * 0.10, 2)
+    WHEN 'SENIOR' THEN round(subtotal * 0.20, 2)
+    WHEN 'PROMO' THEN LEAST(subtotal, o.discount_amount)
+    ELSE 0
+  END;
+  UPDATE public.orders
+  SET total_amount = subtotal - new_discount,
+      discount_amount = new_discount
+  WHERE id = _order_id;
+
+  UPDATE public.orders
+  SET status = CASE
+    WHEN active_count > 0 AND ready_count = active_count THEN 'READY'::public.order_status
+    WHEN prep_count > 0 OR ready_count > 0 THEN 'IN_PREP'::public.order_status
+    ELSE 'PENDING'::public.order_status
+  END
+  FROM (
+    SELECT
+      count(*) FILTER (WHERE item_status <> 'CANCELLED') AS active_count,
+      count(*) FILTER (WHERE item_status IN ('READY','COMPLETED')) AS ready_count,
+      count(*) FILTER (WHERE item_status = 'IN_PREP') AS prep_count
+    FROM public.order_items
+    WHERE order_id = _order_id
+  ) AS item_state
+  WHERE id = _order_id;
+
+  INSERT INTO public.order_audit_logs(order_id, employee_id, action, before_state, after_state)
+  VALUES (
+    _order_id, auth.uid(), 'MODIFY',
+    jsonb_build_object('items', before_items, 'total_amount', o.total_amount),
+    jsonb_build_object('items', after_items, 'total_amount', subtotal - new_discount)
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.modify_order(uuid, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.modify_order(uuid, jsonb) TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.settle_order(
+  _order_id uuid,
+  _payment_method text,
+  _cash_received numeric DEFAULT 0,
+  _gcash_amount numeric DEFAULT 0,
+  _gcash_reference text DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  o public.orders;
+  normalized_reference text := NULLIF(btrim(_gcash_reference), '');
+  settled_time timestamptz := now();
+BEGIN
+  IF NOT public.has_any_role(auth.uid(), ARRAY['ADMIN','MANAGER','CASHIER']::public.app_role[]) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  SELECT * INTO o FROM public.orders WHERE id = _order_id FOR UPDATE;
+  IF o.id IS NULL THEN RAISE EXCEPTION 'Order not found'; END IF;
+  IF o.settled_at IS NOT NULL OR o.status IN ('COMPLETED','CANCELLED') THEN
+    RAISE EXCEPTION 'Order cannot be settled';
+  END IF;
+  IF _payment_method IS NULL OR _payment_method NOT IN ('CASH','GCASH','SPLIT') THEN
+    RAISE EXCEPTION 'Select a valid payment method';
+  END IF;
+  IF _payment_method = 'CASH' AND
+    (COALESCE(_cash_received, 0) < o.total_amount
+      OR COALESCE(_gcash_amount, 0) <> 0
+      OR normalized_reference IS NOT NULL) THEN
+    RAISE EXCEPTION 'Cash received must cover the total';
+  ELSIF _payment_method = 'GCASH' AND
+    (COALESCE(_cash_received, 0) <> 0
+      OR COALESCE(_gcash_amount, 0) <> o.total_amount
+      OR (normalized_reference IS NOT NULL AND normalized_reference !~ '^[0-9]{4,13}$')) THEN
+    RAISE EXCEPTION 'GCash amount must equal the order total and the optional reference must contain 4-13 digits';
+  ELSIF _payment_method = 'SPLIT' AND
+    (COALESCE(_cash_received, 0) < 0
+      OR COALESCE(_gcash_amount, 0) <= 0
+      OR COALESCE(_cash_received, 0) + COALESCE(_gcash_amount, 0) <> o.total_amount
+      OR (normalized_reference IS NOT NULL AND normalized_reference !~ '^[0-9]{4,13}$')) THEN
+    RAISE EXCEPTION 'Split tender must equal the total; the optional GCash reference must contain 4-13 digits';
+  END IF;
+
+  UPDATE public.orders
+  SET payment_method = _payment_method,
+      cash_received = COALESCE(_cash_received, 0),
+      gcash_amount = COALESCE(_gcash_amount, 0),
+      gcash_reference = CASE
+        WHEN _payment_method IN ('GCASH','SPLIT') THEN normalized_reference
+        ELSE NULL
+      END,
+      payment_reference = CASE
+        WHEN _payment_method IN ('GCASH','SPLIT') THEN normalized_reference
+        ELSE NULL
+      END,
+      settled_at = settled_time,
+      status = 'COMPLETED'
+  WHERE id = _order_id;
+
+  UPDATE public.order_items
+  SET item_status = 'COMPLETED'
+  WHERE order_id = _order_id AND item_status <> 'CANCELLED';
+
+  INSERT INTO public.order_audit_logs(order_id, employee_id, action, before_state, after_state)
+  VALUES (
+    _order_id,
+    auth.uid(),
+    'SETTLE',
+    jsonb_build_object('settled_at', o.settled_at, 'status', o.status),
+    jsonb_build_object(
+      'payment_method', _payment_method,
+      'cash_received', COALESCE(_cash_received, 0),
+      'gcash_amount', COALESCE(_gcash_amount, 0),
+      'gcash_reference', normalized_reference,
+      'settled_at', settled_time,
+      'status', 'COMPLETED'
+    )
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.settle_order(uuid, text, numeric, numeric, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.settle_order(uuid, text, numeric, numeric, text) TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.place_order(payload jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  o public.orders;
+  existing public.orders;
+  it jsonb;
+  mi public.menu_items;
+  subtotal numeric := 0;
+  disc numeric := 0;
+  qty int;
+  line_price numeric;
+  payment_method text := COALESCE(NULLIF(payload->>'payment_method', ''), 'CASH');
+  cash_amount numeric := COALESCE(NULLIF(payload->>'cash_received', '')::numeric, 0);
+  gcash_amount numeric := COALESCE(NULLIF(payload->>'gcash_amount', '')::numeric, 0);
+  gcash_reference text := NULLIF(btrim(payload->>'gcash_reference'), '');
+  is_paid boolean;
+BEGIN
+  IF NOT public.has_any_role(auth.uid(), ARRAY['ADMIN','MANAGER','CASHIER']::public.app_role[]) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  IF jsonb_typeof(payload->'items') IS DISTINCT FROM 'array' THEN
+    RAISE EXCEPTION 'Invalid order items';
+  END IF;
+  IF jsonb_array_length(payload->'items') = 0 THEN
+    RAISE EXCEPTION 'Add at least one item to the order';
+  END IF;
+
+  SELECT * INTO existing
+  FROM public.orders
+  WHERE client_id = (payload->>'client_id')::uuid;
+  IF existing.id IS NOT NULL THEN
+    RETURN jsonb_build_object(
+      'id', existing.id,
+      'order_number', existing.order_number,
+      'duplicate', true
+    );
+  END IF;
+
+  IF payment_method NOT IN ('UNPAID','CASH','GCASH') THEN
+    RAISE EXCEPTION 'Select a valid payment method';
+  END IF;
+  is_paid := payment_method <> 'UNPAID';
+  IF gcash_reference IS NOT NULL AND gcash_reference !~ '^[0-9]{4,13}$' THEN
+    RAISE EXCEPTION 'GCash reference must contain 4-13 digits when provided';
+  END IF;
+
+  FOR it IN SELECT * FROM jsonb_array_elements(payload->'items') LOOP
+    SELECT * INTO mi FROM public.menu_items WHERE id = (it->>'menu_item_id')::uuid;
+    IF mi.id IS NULL THEN RAISE EXCEPTION 'Unknown menu item'; END IF;
+    qty := (it->>'quantity')::int;
+    IF qty IS NULL OR qty < 1 THEN RAISE EXCEPTION 'Item quantity must be at least one'; END IF;
+    line_price := mi.base_price + COALESCE((it->>'modifier_price')::numeric, 0);
+    subtotal := subtotal + line_price * qty;
+  END LOOP;
+
+  disc := CASE payload->>'discount_type'
+    WHEN 'STUDENT' THEN round(subtotal * 0.10, 2)
+    WHEN 'SENIOR' THEN round(subtotal * 0.20, 2)
+    WHEN 'PROMO' THEN LEAST(subtotal, COALESCE((payload->>'promo_amount')::numeric, 0))
+    ELSE 0
+  END;
+
+  IF payment_method = 'UNPAID' THEN
+    IF cash_amount <> 0 OR gcash_amount <> 0 OR gcash_reference IS NOT NULL THEN
+      RAISE EXCEPTION 'Unpaid tickets cannot include payment details';
+    END IF;
+  ELSIF payment_method = 'CASH' THEN
+    cash_amount := COALESCE(NULLIF(payload->>'cash_received', '')::numeric, subtotal - disc);
+    IF cash_amount < subtotal - disc OR gcash_amount <> 0 OR gcash_reference IS NOT NULL THEN
+      RAISE EXCEPTION 'Cash received must cover the total';
+    END IF;
+  ELSE
+    IF cash_amount <> 0 OR gcash_amount NOT IN (0, subtotal - disc) THEN
+      RAISE EXCEPTION 'GCash payment must equal the order total';
+    END IF;
+    gcash_amount := subtotal - disc;
+  END IF;
+
+  INSERT INTO public.orders(
+    client_id, order_type, customer_name, total_amount, discount_type, discount_amount,
+    cashier_id, created_offline, created_at, status, payment_method, cash_received,
+    gcash_amount, gcash_reference, payment_reference, settled_at
+  )
+  VALUES (
+    (payload->>'client_id')::uuid,
+    (payload->>'order_type')::public.order_type,
+    NULLIF(btrim(payload->>'customer_name'), ''),
+    subtotal - disc,
+    NULLIF(payload->>'discount_type', ''),
+    disc,
+    auth.uid(),
+    COALESCE((payload->>'offline')::boolean, false),
+    COALESCE((payload->>'created_at')::timestamptz, now()),
+    CASE WHEN is_paid THEN 'COMPLETED'::public.order_status ELSE 'PENDING'::public.order_status END,
+    payment_method,
+    CASE WHEN payment_method = 'CASH' THEN cash_amount ELSE 0 END,
+    CASE WHEN payment_method = 'GCASH' THEN gcash_amount ELSE 0 END,
+    CASE WHEN payment_method = 'GCASH' THEN gcash_reference ELSE NULL END,
+    CASE WHEN payment_method = 'GCASH' THEN gcash_reference ELSE NULL END,
+    CASE WHEN is_paid THEN now() ELSE NULL END
+  )
+  RETURNING * INTO o;
+
+  FOR it IN SELECT * FROM jsonb_array_elements(payload->'items') LOOP
+    SELECT * INTO mi FROM public.menu_items WHERE id = (it->>'menu_item_id')::uuid;
+    qty := (it->>'quantity')::int;
+    INSERT INTO public.order_items(
+      order_id, menu_item_id, name, station, quantity, modifiers, item_price, item_status
+    )
+    VALUES (
+      o.id, mi.id, mi.name, mi.target_station, qty, it->'modifiers',
+      mi.base_price + COALESCE((it->>'modifier_price')::numeric, 0),
+      CASE WHEN is_paid THEN 'COMPLETED'::public.order_status ELSE 'PENDING'::public.order_status END
+    );
+
+    UPDATE public.ingredients i
+    SET current_stock = i.current_stock - r.quantity_req * qty
+    FROM public.recipe_ingredients r
+    WHERE r.menu_item_id = mi.id AND r.ingredient_id = i.id;
+
+    INSERT INTO public.stock_transactions(ingredient_id, change, reason, order_id, user_id)
+    SELECT r.ingredient_id, -r.quantity_req * qty, 'SALE', o.id, auth.uid()
+    FROM public.recipe_ingredients r
+    WHERE r.menu_item_id = mi.id;
+  END LOOP;
+
+  IF is_paid THEN
+    INSERT INTO public.order_audit_logs(order_id, employee_id, action, before_state, after_state)
+    VALUES (
+      o.id,
+      auth.uid(),
+      'SETTLE',
+      jsonb_build_object('settled_at', NULL, 'status', 'PENDING'),
+      jsonb_build_object(
+        'payment_method', payment_method,
+        'cash_received', CASE WHEN payment_method = 'CASH' THEN cash_amount ELSE 0 END,
+        'gcash_amount', CASE WHEN payment_method = 'GCASH' THEN gcash_amount ELSE 0 END,
+        'gcash_reference', gcash_reference,
+        'settled_at', o.settled_at,
+        'status', 'COMPLETED'
+      )
+    );
+  END IF;
+
+  RETURN jsonb_build_object('id', o.id, 'order_number', o.order_number, 'duplicate', false);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.place_order(jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.place_order(jsonb) TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.get_income_analytics(
+  _start timestamptz,
+  _end timestamptz
+)
+RETURNS TABLE(day date, revenue numeric, order_count bigint)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NOT public.has_role(auth.uid(), 'ADMIN'::public.app_role) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  IF _start IS NULL OR _end IS NULL OR _start >= _end THEN
+    RAISE EXCEPTION 'Invalid analytics date range';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    (o.settled_at AT TIME ZONE 'Asia/Manila')::date AS day,
+    COALESCE(SUM(o.total_amount), 0)::numeric AS revenue,
+    COUNT(*)::bigint AS order_count
+  FROM public.orders o
+  WHERE o.status = 'COMPLETED'::public.order_status
+    AND o.settled_at IS NOT NULL
+    AND o.settled_at >= _start
+    AND o.settled_at < _end
+  GROUP BY (o.settled_at AT TIME ZONE 'Asia/Manila')::date
+  ORDER BY (o.settled_at AT TIME ZONE 'Asia/Manila')::date;
+END;
+$$;
+
+NOTIFY pgrst, 'reload schema';

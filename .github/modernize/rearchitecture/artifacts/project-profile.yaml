@@ -1,0 +1,43 @@
+project:
+  scope_path: "."
+  loc: 12880
+  languages: [JavaScript/TypeScript]
+  git: false
+  structure:
+    src: "Application source (implementation details delegated to workers)"
+    supabase: "Existing Supabase integration/configuration"
+    public: "Static application assets"
+    scripts: "Project scripts"
+  notes: "Cantilounge TypeScript application; request replaces Supabase/PostgreSQL authentication and data access with a local XAMPP MySQL/MariaDB-backed API using the supplied SQL schema."
+
+assessment:
+  change_type: rewrite
+  rationale: |
+    The requested change replaces the Supabase/PostgreSQL data and authentication backend with a custom compatible server API backed by XAMPP MySQL/MariaDB. The coarse repository profile identifies a modest TypeScript/JavaScript application with src and supabase areas; implementation-specific scope will be established by workers.
+  transformations:
+    - fromStack: "Supabase / PostgreSQL"
+      fromStackVersion: "unspecified"
+      toStack: "Local Node.js API / MySQL or MariaDB via XAMPP"
+      toStackVersion: "unspecified"
+  grouping_needed: false
+  deep_planning: undecided
+
+progress_sync:
+  run_id: b69d5641-08bb-4b54-9d0d-6c1810953d2d
+  grouping_mode: none
+  execution_mode: pending
+  plan_start_time: "2026-11-18T01:22:49Z"
+  plan_completed_time: null
+  execution_start_time: null
+  execution_completed_time: null
+  validation_start_time: null
+  validation_completed_time: null
+  total_phases: 0
+  completed_phases: 0
+  total_modules: 2
+  completed_modules: 0
+  total_tasks: 0
+  completed_tasks: 0
+  total_commits: 0
+  build_verified: false
+  test_verified: false
