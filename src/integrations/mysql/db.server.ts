@@ -42,12 +42,18 @@ export function getPool() {
   if (!["mysql:", "mariadb:"].includes(parsed.protocol)) {
     throw new Error("DATABASE_URL must use the mysql:// or mariadb:// scheme.");
   }
+  const useSsl =
+    parsed.hostname.endsWith("tidbcloud.com") ||
+    parsed.searchParams.get("ssl") === "true" ||
+    parsed.searchParams.get("ssl-mode") === "REQUIRED";
+
   pool = createPool({
     host: parsed.hostname,
     port: parsed.port ? Number(parsed.port) : 3306,
     user: decodeURIComponent(parsed.username),
     password: decodeURIComponent(parsed.password),
     database: decodeURIComponent(parsed.pathname.replace(/^\/+/, "")),
+    ...(useSsl ? { ssl: { rejectUnauthorized: true } } : {}),
     connectionLimit: Number(process.env["DB_POOL_SIZE"] || 10),
     waitForConnections: true,
     queueLimit: 0,
